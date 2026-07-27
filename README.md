@@ -1,7 +1,7 @@
 # Retail DWH Design — Online + Offline Sales
 
 Launch:
-``bash
+```bash
 cd etl
 python etl_pipeline.py \
     --offline ../data/offline_legacy_erp.csv \
@@ -30,6 +30,5 @@ retail-dwh-design/
 ├── data/
 │   ├── sample_offline_legacy_erp.csv
 │   └── sample_online_web_store.csv
-└── output/
-    └── retail_dwh.db (generated when starting the pipeline)
-``
+
+```
