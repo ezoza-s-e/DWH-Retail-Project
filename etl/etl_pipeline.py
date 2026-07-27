@@ -1,139 +1,182 @@
 """
 ETL pipeline: online-web-store + offline-legacy-erp -> retail DWH (star schema)
 
-
-run:
-    python etl_pipeline.py --offline path/to/offline_legacy_erp.csv \
-                            --online  path/to/online_web_store.csv \
-                            --out     ../output/retail_dwh.db
 """
+
 import argparse
-import sqlite3
+import os
+
 import pandas as pd
+from sqlalchemy import create_engine, text
 
 
-def load_offline(path: str) -> pd.DataFrame:
-    df = pd.read_csv(path, sep=";", encoding="utf-8-sig")
-    df["Order_Date"] = pd.to_datetime(df["Order_Date"], format="%d.%m.%Y", errors="coerce")
-    df["Ship_Date"] = pd.to_datetime(df["Ship_Date"], format="%d.%m.%Y", errors="coerce")
-    for col in ["Sales", "Profit"]:
-        df[col] = (
-            df[col].astype(str).str.replace("$", "", regex=False)
-            .str.replace(" ", "", regex=False).str.replace(",", ".", regex=False)
-        ).astype(float)
-    df["Shipping Cost"] = (
-        df["Shipping Cost"].astype(str).str.replace(",", ".", regex=False)
-    ).astype(float)
-    df["Channel"] = "Offline"
-    df["Device_Type"] = None
-    df["Payment_Method"] = None
-    return df
+
+def get_engine(args):
+    host = args.host or os.environ.get("PGHOST", "localhost")
+    port = args.port or os.environ.get("PGPORT", "5432")
+    dbname = args.dbname or os.environ.get("PGDATABASE", "retail_dwh")
+    user = args.user or os.environ.get("PGUSER", "postgres")
+    password = args.password or os.environ.get("PGPASSWORD", "")
+    url = f"postgresql+psycopg2://{user}:{password}@{host}:{port}/{dbname}"
+    return create_engine(url)
 
 
-def load_online(path: str) -> pd.DataFrame:
-    df = pd.read_csv(path, sep=";", encoding="utf-8-sig")
-    df["Order Date"] = pd.to_datetime(df["Order Date"], format="%d.%m.%Y", errors="coerce")
-    df["Ship Date"] = pd.to_datetime(df["Ship Date"], format="%d.%m.%Y", errors="coerce")
-    for col in ["Sales", "Profit"]:
-        df[col] = (
-            df[col].astype(str).str.replace("$", "", regex=False)
-            .str.replace(" ", "", regex=False).str.replace(",", ".", regex=False)
-        ).astype(float)
-    df["Shipping Cost"] = (
-        df["Shipping Cost"].astype(str).str.replace(",", ".", regex=False)
-    ).astype(float)
-    # normalize column names to match offline schema for the shared merge step
-    df = df.rename(columns={
-        "Order Date": "Order_Date", "Ship Date": "Ship_Date",
-        "Customer ID": "Customer_ID", "Customer First Name": "Customer_FirstName",
-        "Customer Last Name": "Customer_LastName", "Customer Phone": "Customer_Phone",
-        "Customer Segment": "Customer_Segment", "Geo PostalCode": "Geo_PostalCode",
-        "Geo City": "Geo_City", "Geo State": "Geo_State", "Geo Country": "Geo_Country",
-        "Geo Region": "Geo_Region", "Geo Market": "Geo_Market", "SubCategory": "Sub_Category",
-        "Product Name": "Product_Name", "Product Supplier": "Product_Supplier",
-    })
-    return df
+
+def parse_date(series: pd.Series) -> pd.Series:
+    return pd.to_datetime(series, format="%d.%m.%Y", errors="coerce")
+
+
+def parse_money(series: pd.Series) -> pd.Series:
+    return (
+        series.astype(str)
+        .str.replace("$", "", regex=False)
+        .str.replace(" ", "", regex=False)
+        .str.replace(",", ".", regex=False)
+        .replace({"nan": None, "": None})
+        .astype(float)
+    )
+
+
+
+
+def load_staging(engine) -> tuple[pd.DataFrame, pd.DataFrame]:
+    online = pd.read_sql("SELECT * FROM staging.stg_online_web_store", engine)
+    offline = pd.read_sql("SELECT * FROM staging.stg_offline_legacy_erp", engine)
+
+    for df, channel in ((online, "Online"), (offline, "Offline")):
+        df["order_date"] = parse_date(df["order_date"])
+        df["ship_date"] = parse_date(df["ship_date"])
+        df["sales"] = parse_money(df["sales"])
+        df["profit"] = parse_money(df["profit"])
+        df["shipping_cost"] = parse_money(df["shipping_cost"])
+        df["discount"] = pd.to_numeric(df["discount"].astype(str).str.replace(",", "."), errors="coerce")
+        df["quantity"] = pd.to_numeric(df["quantity"], errors="coerce").astype("Int64")
+        df["channel"] = channel
+
+    return online, offline
+
+
 
 
 def build_dim_date(all_dates: pd.Series) -> pd.DataFrame:
     dates = pd.to_datetime(all_dates.dropna().unique())
-    dim = pd.DataFrame({"Full_Date": dates})
-    dim["Date_ID"] = dim["Full_Date"].dt.strftime("%Y%m%d").astype(int)
-    dim["Day"] = dim["Full_Date"].dt.day
-    dim["Month"] = dim["Full_Date"].dt.month
-    dim["Month_Name"] = dim["Full_Date"].dt.strftime("%B")
-    dim["Quarter"] = dim["Full_Date"].dt.quarter
-    dim["Year"] = dim["Full_Date"].dt.year
-    return dim.sort_values("Date_ID").reset_index(drop=True)
+    dim = pd.DataFrame({"full_date": dates})
+    dim["date_id"] = dim["full_date"].dt.strftime("%Y%m%d").astype(int)
+    dim["day"] = dim["full_date"].dt.day
+    dim["month"] = dim["full_date"].dt.month
+    dim["month_name"] = dim["full_date"].dt.strftime("%B")
+    dim["quarter"] = dim["full_date"].dt.quarter
+    dim["year"] = dim["full_date"].dt.year
+    return dim.sort_values("date_id").reset_index(drop=True)
 
 
 def build_dim_product(combined: pd.DataFrame) -> pd.DataFrame:
-    dim = combined[["Product_ID", "Product_Name", "Sub_Category", "Category"]].drop_duplicates("Product_ID")
-    return dim.reset_index(drop=True)
+    dim = (
+        combined[["product_id", "product_name", "sub_category", "category", "product_supplier"]]
+        .drop_duplicates("product_id")
+        .rename(columns={"sub_category": "subcategory_name", "category": "category_name"})
+        .reset_index(drop=True)
+    )
+    dim.insert(0, "product_surr_id", dim.index + 1)
+    return dim
 
 
 def build_dim_customer(combined: pd.DataFrame) -> pd.DataFrame:
-    dim = combined[["Customer_ID", "Customer_FirstName", "Customer_LastName", "Customer_Segment"]].drop_duplicates("Customer_ID")
-    dim["Customer_Name"] = dim["Customer_FirstName"].fillna("") + " " + dim["Customer_LastName"].fillna("")
-    return dim[["Customer_ID", "Customer_Name", "Customer_Segment"]].reset_index(drop=True)
+    dim = combined[["customer_id", "customer_first_name", "customer_last_name", "customer_segment"]].drop_duplicates("customer_id")
+    dim["customer_name"] = dim["customer_first_name"].fillna("") + " " + dim["customer_last_name"].fillna("")
+    dim = dim.rename(columns={"customer_segment": "segment"})[["customer_id", "customer_name", "segment"]].reset_index(drop=True)
+    dim.insert(0, "customer_surr_id", dim.index + 1)
+    return dim
 
 
 def build_dim_geography(combined: pd.DataFrame) -> pd.DataFrame:
-    cols = ["Geo_Market", "Geo_Region", "Geo_Country", "Geo_State", "Geo_City", "Geo_PostalCode"]
+    cols = ["geo_market", "geo_region", "geo_country", "geo_state", "geo_city", "geo_postalcode"]
     dim = combined[cols].drop_duplicates().reset_index(drop=True)
-    dim.insert(0, "Geography_ID", dim.index + 1)
+    dim = dim.rename(columns={
+        "geo_market": "market", "geo_region": "region", "geo_country": "country",
+        "geo_state": "state", "geo_city": "city", "geo_postalcode": "postal_code",
+    })
+    dim.insert(0, "geography_id", dim.index + 1)
     return dim
 
 
 def build_dim_store(offline: pd.DataFrame) -> pd.DataFrame:
-    dim = offline[["Store_ID", "Store_Address", "Store_Type", "Store_phone"]].drop_duplicates("Store_ID")
+    dim = offline[["store_id", "store_address", "store_type", "store_phone"]].drop_duplicates("store_id")
     return dim.reset_index(drop=True)
 
 
 def build_dim_cashier(offline: pd.DataFrame) -> pd.DataFrame:
-    dim = offline[["Cashier_ID", "Cashier_FirstNname", "Cashier_LastNname", "Cashier_Email", "Cashier_phone"]].drop_duplicates("Cashier_ID")
-    dim = dim.rename(columns={"Cashier_FirstNname": "First_Name", "Cashier_LastNname": "Last_Name"})
+    dim = offline[["cashier_id", "cashier_first_name", "cashier_last_name", "cashier_email", "cashier_phone"]].drop_duplicates("cashier_id")
+    dim = dim.rename(columns={"cashier_first_name": "first_name", "cashier_last_name": "last_name",
+                               "cashier_email": "email", "cashier_phone": "phone"})
     return dim.reset_index(drop=True)
 
 
-def build_fact_sales(combined: pd.DataFrame, dim_geo: pd.DataFrame) -> pd.DataFrame:
-    geo_key_cols = ["Geo_Market", "Geo_Region", "Geo_Country", "Geo_State", "Geo_City", "Geo_PostalCode"]
-    merged = combined.merge(dim_geo, on=geo_key_cols, how="left")
-    fact = pd.DataFrame({
-        "Order_ID": merged["Order_ID"],
-        "Date_ID": merged["Order_Date"].dt.strftime("%Y%m%d").astype("Int64"),
-        "Customer_ID": merged["Customer_ID"],
-        "Product_ID": merged["Product_ID"],
-        "Geography_ID": merged["Geography_ID"],
-        "Store_ID": merged.get("Store_ID"),
-        "Cashier_ID": merged.get("Cashier_ID"),
-        "Channel": merged["Channel"],
-        "Quantity": merged["Quantity"],
-        "Sales_Amount": merged["Sales"],
-        "Discount": merged["Discount"],
-        "Profit": merged["Profit"],
-        "Shipping_Cost": merged["Shipping Cost"],
+def build_fact_sales(combined: pd.DataFrame, dim_geo: pd.DataFrame, dim_product: pd.DataFrame, dim_customer: pd.DataFrame) -> pd.DataFrame:
+    geo_key_cols = ["geo_market", "geo_region", "geo_country", "geo_state", "geo_city", "geo_postalcode"]
+    dim_geo_keys = dim_geo.rename(columns={
+        "market": "geo_market", "region": "geo_region", "country": "geo_country",
+        "state": "geo_state", "city": "geo_city", "postal_code": "geo_postalcode",
     })
-    fact["Total_Cost"] = fact["Shipping_Cost"] + (fact["Sales_Amount"] - fact["Profit"])
-    fact.insert(0, "Sales_ID", range(1, len(fact) + 1))
+    merged = combined.merge(dim_geo_keys[geo_key_cols + ["geography_id"]], on=geo_key_cols, how="left")
+    merged = merged.merge(dim_product[["product_id", "product_surr_id"]], on="product_id", how="left")
+    merged = merged.merge(dim_customer[["customer_id", "customer_surr_id"]], on="customer_id", how="left")
+
+    fact = pd.DataFrame({
+        "order_id": merged["order_id"],
+        "date_id": merged["order_date"].dt.strftime("%Y%m%d").astype("Int64"),
+        "customer_surr_id": merged["customer_surr_id"],
+        "product_surr_id": merged["product_surr_id"],
+        "geography_id": merged["geography_id"],
+        "store_id": merged.get("store_id"),
+        "cashier_id": merged.get("cashier_id"),
+        "channel": merged["channel"],
+        "quantity": merged["quantity"],
+        "sales_amount": merged["sales"],
+        "discount": merged["discount"],
+        "profit": merged["profit"],
+        "shipping_cost": merged["shipping_cost"],
+    })
+    fact = fact.dropna(subset=["date_id", "customer_surr_id", "product_surr_id", "geography_id"])
+    fact.insert(0, "sales_id", range(1, len(fact) + 1))
     return fact
+
+
+
+def load_dimensional(engine, dim_date, dim_product, dim_customer, dim_geo, dim_store, dim_cashier, fact_sales):
+    with engine.begin() as conn:
+        
+        conn.execute(text("TRUNCATE TABLE dm.fct_sales, dm.dim_date, dm.dim_product, "
+                           "dm.dim_customer, dm.dim_geography, dm.dim_store, dm.dim_cashier "
+                           "RESTART IDENTITY CASCADE"))
+
+    dim_date.to_sql("dim_date", engine, schema="dm", if_exists="append", index=False)
+    dim_product.to_sql("dim_product", engine, schema="dm", if_exists="append", index=False)
+    dim_customer.to_sql("dim_customer", engine, schema="dm", if_exists="append", index=False)
+    dim_geo.to_sql("dim_geography", engine, schema="dm", if_exists="append", index=False)
+    dim_store.to_sql("dim_store", engine, schema="dm", if_exists="append", index=False)
+    dim_cashier.to_sql("dim_cashier", engine, schema="dm", if_exists="append", index=False)
+    fact_sales.to_sql("fct_sales", engine, schema="dm", if_exists="append", index=False, chunksize=10000)
 
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--offline", required=True)
-    parser.add_argument("--online", required=True)
-    parser.add_argument("--out", required=True)
+    parser.add_argument("--host")
+    parser.add_argument("--port")
+    parser.add_argument("--dbname")
+    parser.add_argument("--user")
+    parser.add_argument("--password")
     args = parser.parse_args()
 
-    print("Loading source files...")
-    offline = load_offline(args.offline)
-    online = load_online(args.online)
-    combined = pd.concat([offline, online], ignore_index=True, sort=False)
-    print(f"  offline rows: {len(offline):,} | online rows: {len(online):,} | combined: {len(combined):,}")
+    engine = get_engine(args)
 
-    print("Building dimension tables...")
-    dim_date = build_dim_date(combined["Order_Date"])
+    print("Reading staging tables from Postgres...")
+    online, offline = load_staging(engine)
+    combined = pd.concat([online, offline], ignore_index=True, sort=False)
+    print(f"  online: {len(online):,} | offline: {len(offline):,} | combined: {len(combined):,}")
+
+    print("Building dimensions...")
+    dim_date = build_dim_date(combined["order_date"])
     dim_product = build_dim_product(combined)
     dim_customer = build_dim_customer(combined)
     dim_geo = build_dim_geography(combined)
@@ -141,20 +184,12 @@ def main():
     dim_cashier = build_dim_cashier(offline)
 
     print("Building fact table...")
-    fact_sales = build_fact_sales(combined, dim_geo)
+    fact_sales = build_fact_sales(combined, dim_geo, dim_product, dim_customer)
 
-    print(f"Writing to {args.out} ...")
-    conn = sqlite3.connect(args.out)
-    dim_date.to_sql("dim_date", conn, if_exists="replace", index=False)
-    dim_product.to_sql("dim_product", conn, if_exists="replace", index=False)
-    dim_customer.to_sql("dim_customer", conn, if_exists="replace", index=False)
-    dim_geo.to_sql("dim_geography", conn, if_exists="replace", index=False)
-    dim_store.to_sql("dim_store", conn, if_exists="replace", index=False)
-    dim_cashier.to_sql("dim_cashier", conn, if_exists="replace", index=False)
-    fact_sales.to_sql("fct_sales", conn, if_exists="replace", index=False)
-    conn.close()
+    print("Loading dm schema in Postgres...")
+    load_dimensional(engine, dim_date, dim_product, dim_customer, dim_geo, dim_store, dim_cashier, fact_sales)
 
-    print("Done. Row counts:")
+    print("Done. Row counts loaded into dm.*:")
     print(f"  dim_date:      {len(dim_date):,}")
     print(f"  dim_product:   {len(dim_product):,}")
     print(f"  dim_customer:  {len(dim_customer):,}")
@@ -166,3 +201,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
