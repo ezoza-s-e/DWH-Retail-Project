@@ -1,0 +1,10 @@
+# Full source datasets are too big for git (100+ MB) —
+# the repository contains only data/sample_*.csv
+data/offline_legacy_erp.csv
+data/online_web_store.csv
+
+# Generated at startup etl_pipeline.py 
+output/*.db
+
+__pycache__/
+*.pyc
